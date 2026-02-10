@@ -820,38 +820,159 @@ async function generateWithAI(systemPrompt: string, userPrompt: string): Promise
 }
 
 // ============================================
-// STEP 2: LLM으로 SEO 최적화 글 생성 (긴 버전)
+// 페르소나 설정 로드
+// ============================================
+const PERSONA_PATH = path.join(process.cwd(), "persona", "persona.md");
+
+interface PersonaContext {
+  situation: string;      // 오늘 상황 (택배온날, 주말, 비오는날...)
+  postType: string;       // 글 타입 (첫구매, 재구매, 선물용...)
+  emotionTone: string;    // 감정톤 (만족, 무난, 약간아쉬움)
+  situationIntro: string; // 상황별 도입부
+}
+
+function getRandomPersonaContext(): PersonaContext {
+  // 상황 옵션
+  const situations = [
+    { name: "택배온날", intro: "오늘 택배가 와서 바로 열어봤어요" },
+    { name: "주말", intro: "주말이라 여유롭게 써봤어요" },
+    { name: "비오는날", intro: "비 와서 집에만 있었는데 마침 택배가 왔어요" },
+    { name: "외출전", intro: "나가기 전에 급하게 써봤는데" },
+    { name: "자취일상", intro: "자취하면서 이런 거 하나씩 사게 되더라고요" },
+    { name: "퇴근후", intro: "퇴근하고 집에 오니까 택배가 와있더라고요" },
+    { name: "평일저녁", intro: "저녁 먹고 느긋하게 개봉해봤어요" },
+  ];
+  
+  // 글 타입 옵션
+  const postTypes = [
+    "첫구매",
+    "재구매", 
+    "선물용",
+    "비교후구매",
+    "충동구매",
+  ];
+  
+  // 감정톤 옵션
+  const emotionTones = [
+    "만족",
+    "무난",
+    "약간아쉬움",
+    "기대이상",
+  ];
+  
+  const situation = situations[Math.floor(Math.random() * situations.length)];
+  const postType = postTypes[Math.floor(Math.random() * postTypes.length)];
+  const emotionTone = emotionTones[Math.floor(Math.random() * emotionTones.length)];
+  
+  return {
+    situation: situation.name,
+    postType,
+    emotionTone,
+    situationIntro: situation.intro,
+  };
+}
+
+// ============================================
+// STEP 2: LLM으로 SEO 최적화 글 생성 (페르소나 버전)
 // ============================================
 async function step2_generatePost(product: ProductInfo, brandLink: string): Promise<{ title: string; sections: string[]; hashtags: string[] }> {
-  console.log("\n📝 STEP 2: SEO 최적화 블로그 글 생성 (확장판)");
+  console.log("\n📝 STEP 2: SEO 최적화 블로그 글 생성 (페르소나 버전)");
   console.log(`   🤖 AI Provider: ${AI_PROVIDER.toUpperCase()}`);
   
+  // 랜덤 컨텍스트 생성
+  const ctx = getRandomPersonaContext();
+  console.log(`   📌 상황: ${ctx.situation} | 타입: ${ctx.postType} | 톤: ${ctx.emotionTone}`);
+  
   const imageCount = Math.max(product.imagePaths.length, 8);  // 최소 8섹션
-  
-  // 인트로 변화를 위한 랜덤 요소
-  const intros = [
-    "요즘 고민하다가 드디어 질렀어요",
-    "궁금해서 바로 주문해봤어요", 
-    "많이들 추천하셔서 저도 써봤어요",
-    "오랫동안 찾던 제품을 드디어 발견했어요",
-    "친구 추천으로 구매하게 됐어요"
-  ];
-  const randomIntro = intros[Math.floor(Math.random() * intros.length)];
-  
-  const endings = [
-    "강력 추천드려요", "만족스러워요", "재구매 의사 있어요",
-    "가성비 좋아요", "후회 없는 선택이에요"
-  ];
-  const randomEnding = endings[Math.floor(Math.random() * endings.length)];
 
-  const systemPrompt = `당신은 인기 네이버 블로거입니다. 
-- 친근하고 솔직한 ~요체 사용 (했어요, 같아요, 더라고요, 거든요)
-- 상품을 정확히 이해하고 실제 사용한 것처럼 생생하게 작성
-- SEO를 위해 상품명, 관련 키워드를 자연스럽게 본문에 포함
-- 매번 조금씩 다른 표현 사용 (똑같은 문구 반복 금지)
-- 과장 없이 신뢰감 있게 작성`;
+  // ========== 페르소나 시스템 프롬프트 ==========
+  const systemPrompt = `당신은 "쿠썬"이라는 닉네임의 30대 중반 자취 여성입니다.
 
-  const userPrompt = `다음 상품의 상세 블로그 리뷰를 작성해주세요.
+## 당신의 프로필
+- 직업: 프리랜서 (재택 위주, 시간 유연)
+- 주거: 혼자 자취 중 (원룸 또는 소형 아파트)
+- 성격: 살림에 관심 많고, 가성비 쇼핑 좋아함, 실용성 중시
+- 컨셉: "엄청 꾸미지 않은데 은근 현실적인 사람"
+
+## 말투 규칙
+- ~요체 사용 (했어요, 같아요, 거든요, 더라고요)
+- 친근하고 솔직한 톤
+- 과장 없이 담백하게
+- 가끔 혼잣말처럼 ("이거 진짜 괜찮더라고요")
+
+## 자주 쓰는 표현
+- "솔직히 말하면~", "근데 이게~", "저는 개인적으로~"
+- "사실 좀 고민했거든요", "결론부터 말하면~", "아 그리고~"
+
+## 절대 쓰지 않는 표현
+- "강력 추천합니다!" (광고 느낌)
+- "최고예요!" (과장)
+- "꼭 사세요!" (푸시)
+- 뻔한 칭찬
+
+## 목표
+전문 리뷰어가 아닌, 동네 언니/지인 블로그 느낌으로 작성`;
+
+  // ========== 글 타입별 추가 지시 ==========
+  let postTypeGuide = "";
+  switch (ctx.postType) {
+    case "첫구매":
+      postTypeGuide = `- 구매 전 고민 과정을 자세히 언급
+- 다른 제품과 비교했던 이야기 포함
+- 첫인상 위주로 작성`;
+      break;
+    case "재구매":
+      postTypeGuide = `- "이거 두 번째 구매예요" 같은 표현 사용
+- 왜 다시 샀는지 이유 설명
+- 장기 사용 후기 포함`;
+      break;
+    case "선물용":
+      postTypeGuide = `- 누구한테 줬는지 언급 (언니, 친구, 엄마 등)
+- 받은 사람 반응 포함
+- 선물로 좋은 이유 설명`;
+      break;
+    case "비교후구매":
+      postTypeGuide = `- 다른 제품들과 비교했던 과정 언급
+- 왜 이걸 선택했는지 이유
+- 비교 포인트 구체적으로`;
+      break;
+    case "충동구매":
+      postTypeGuide = `- "원래 살 생각 없었는데" 느낌
+- 왜 갑자기 사게 됐는지
+- 결과적으로 어땠는지`;
+      break;
+  }
+  
+  // ========== 감정톤별 추가 지시 ==========
+  let emotionGuide = "";
+  switch (ctx.emotionTone) {
+    case "만족":
+      emotionGuide = "전반적으로 만족스러운 톤, 하지만 과장 없이 담백하게";
+      break;
+    case "무난":
+      emotionGuide = "기대한 만큼은 나온다는 톤, 특별히 좋지도 나쁘지도 않은 솔직함";
+      break;
+    case "약간아쉬움":
+      emotionGuide = "장점도 있지만 아쉬운 점이 있다는 톤, 하지만 이 가격에 이 정도면 괜찮다는 뉘앙스";
+      break;
+    case "기대이상":
+      emotionGuide = "생각보다 좋았다는 톤, 하지만 과장 없이 구체적으로 왜 좋았는지";
+      break;
+  }
+
+  // ========== 아쉬운 점 예시 (랜덤 선택) ==========
+  const minorFlaws = [
+    "배송이 좀 늦었어요 (3~4일 걸림)",
+    "색상이 사진이랑 살짝 달라요",
+    "설명서가 좀 불친절해요",
+    "포장이 좀 허술했어요",
+    "처음엔 냄새가 좀 났어요 (하루 지나니 괜찮아짐)",
+    "사이즈가 생각보다 작아요",
+    "사이즈가 생각보다 커요",
+  ];
+  const randomFlaw = minorFlaws[Math.floor(Math.random() * minorFlaws.length)];
+
+  const userPrompt = `다음 상품의 블로그 리뷰를 작성해주세요.
 
 ## 상품 정보
 - 상품명: ${product.name}
@@ -865,62 +986,55 @@ ${product.deliveryInfo ? `- 배송: ${product.deliveryInfo}` : ''}
 ${product.reviewCount ? `- 리뷰: ${product.reviewCount}개` : ''}
 ${product.rating ? `- 평점: ${product.rating}점` : ''}
 
-## 이번 글의 톤
-- 인트로 힌트: "${randomIntro}"
-- 마무리 힌트: "${randomEnding}"
-- 이 힌트를 참고해서 자연스럽게 변형해서 사용
+## 오늘의 글 설정
+- 상황: ${ctx.situation}
+- 도입부 힌트: "${ctx.situationIntro}"
+- 글 타입: ${ctx.postType}
+- 감정톤: ${ctx.emotionTone}
+
+## 글 타입 가이드
+${postTypeGuide}
+
+## 감정톤 가이드
+${emotionGuide}
+
+## 아쉬운 점 (참고용, 상품에 맞게 변형)
+"${randomFlaw}" 같은 사소하지만 공감되는 것. 심각한 단점 ❌
 
 ## 작성 규칙
-1. 제목: 상품 카테고리 + 상품명 키워드 포함, 25-35자
-   예: "아기비데 추천 | 해피달링 시그니처 워터탭 솔직 후기"
+1. 제목: 상품 카테고리 + 키워드 포함, 25-35자
+   예: "자취템 추천 | OOO 솔직 후기 (+ 아쉬운 점)"
 
-2. 본문을 ${imageCount}개 섹션으로 작성 (총 2000자 이상)
+2. 본문 ${imageCount}개 섹션 (총 2000자 이상)
 
 3. 각 섹션 구조:
    - 이모지 + 소제목 (한 줄)
    - 빈 줄
-   - 본문 4-6문장 (각 문장 끝에 줄바꿈, 각 문장 30-50자)
+   - 본문 4-6문장 (각 문장 끝에 줄바꿈)
    - 빈 줄
 
-4. 섹션 구성 (${imageCount}개):
-   - 🛒 구매하게 된 계기
-   - 📦 택배 도착 & 개봉기
+4. 섹션 구성 (자연스럽게 재배열 가능):
+   - 🛒 구매 계기 / 고민 과정
+   - 📦 택배 도착 & 개봉
    - ✨ 첫인상 / 디자인
-   - 📐 크기 & 스펙 정보
-   - ⭐ 주요 기능 ①
-   - ⭐ 주요 기능 ② 
-   - 💡 실제 사용 후기
+   - 📐 크기 & 스펙
+   - ⭐ 주요 기능
+   - 💡 실사용 후기
    - ✅ 장점 정리
-   - ⚠️ 아쉬운 점 (솔직하게)
-   - 🎯 이런 분께 추천해요
+   - ⚠️ 아쉬운 점 (솔직하게!)
+   - 🎯 추천 대상
 
-5. SEO 키워드 삽입:
-   - 제목에 메인 키워드
-   - 첫 문장에 상품명 포함
-   - 본문 중간중간 관련 키워드 자연스럽게 배치
+5. SEO: 제목/첫문장에 상품명, 본문에 관련 키워드 자연스럽게
 
-6. 할인/특가 정보 활용 (있는 경우만):
-   - 할인율이 있으면 "🔥 지금 XX% 할인 중!", "특가 진행 중" 등 강조
-   - 쿠폰 정보가 있으면 "쿠폰까지 챙기면 더 싸게!", "추가 할인 가능" 언급
-   - 무료배송이면 "무료배송이라 부담 없어요" 등 언급
-   - 리뷰 수가 많으면 "리뷰가 XXXX개나 되더라고요, 믿고 샀어요" 등 신뢰도 강조
-   - 평점이 높으면 "평점 X.X점으로 검증된 제품" 등 언급
-   - 이런 정보는 구매 유도 섹션이나 마무리 부분에서 자연스럽게 활용
+6. 할인/혜택 정보 (있으면): 자연스럽게 언급, 푸시 느낌 금지
 
-7. 해시태그 20개:
-   - 상품명 관련 (3개)
-   - 카테고리 관련 (5개)  
-   - 검색용 키워드 (7개): 추천, 후기, 리뷰, 비교, 순위, 가격, 장단점
-   - 일반 태그 (5개): 일상, 육아템, 생활용품, 가성비 등
+7. 해시태그 20개
 
-## 출력 (JSON만, 줄바꿈은 \\n)
+## 출력 (JSON만)
 {
-  "title": "SEO 최적화 제목",
-  "sections": [
-    "🛒 소제목\\n\\n문장1.\\n문장2.\\n문장3.\\n문장4.\\n",
-    "📦 소제목\\n\\n문장1.\\n문장2.\\n문장3.\\n"
-  ],
-  "hashtags": ["키워드1", "키워드2", ...]
+  "title": "제목",
+  "sections": ["섹션1", "섹션2", ...],
+  "hashtags": ["태그1", "태그2", ...]
 }`;
   
   const text = await generateWithAI(systemPrompt, userPrompt);
