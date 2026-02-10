@@ -61,9 +61,10 @@ def generate_product_image(
     scene_type: str = "holding",
     custom_prompt: str = None,
     output_folder: str = None,
-    model_code: str = "nano_banana_2",
-    aspect_ratio: str = "4:3",
+    model_code: str = "nano_banana_2",  # 또는 "nano_banana_pro"
+    aspect_ratio: str = "1:1",  # 기본 1:1 (정사각형)
     resolution: str = "2K",
+    unlimited_mode: bool = True,
 ) -> str:
     """
     쿠썬 + 제품 콜라보 이미지 생성
