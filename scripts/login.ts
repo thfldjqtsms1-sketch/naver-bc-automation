@@ -9,12 +9,35 @@ import { chromium } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import * as fs from "fs";
 import * as path from "path";
+import * as dotenv from "dotenv";
 
 // Stealth 플러그인 적용 (봇 감지 우회)
 chromium.use(StealthPlugin());
 
 const STORAGE_PATH = path.join(process.cwd(), "playwright", "storage");
 const SESSION_FILE = path.join(STORAGE_PATH, "naver-session.json");
+const ENV_PATH = path.join(process.cwd(), ".env");
+
+// .env에 세션 백업 저장
+function backupSessionToEnv(sessionPath: string) {
+  try {
+    const sessionData = fs.readFileSync(sessionPath, 'utf-8');
+    const base64Session = Buffer.from(sessionData).toString('base64');
+    
+    let envContent = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, 'utf-8') : '';
+    
+    // 기존 NAVER_SESSION_BACKUP 제거
+    envContent = envContent.replace(/^NAVER_SESSION_BACKUP=.*$/m, '').trim();
+    
+    // 새 백업 추가
+    envContent += `\nNAVER_SESSION_BACKUP="${base64Session}"`;
+    
+    fs.writeFileSync(ENV_PATH, envContent.trim() + '\n');
+    console.log("   📦 .env에 세션 백업 완료");
+  } catch (error) {
+    console.log("   ⚠️ .env 백업 실패:", error);
+  }
+}
 
 // 폴더가 없으면 생성
 if (!fs.existsSync(STORAGE_PATH)) {
@@ -143,6 +166,7 @@ async function mainV2() {
       
       // 세션 저장
       await context.storageState({ path: SESSION_FILE });
+      backupSessionToEnv(SESSION_FILE);
       console.log("");
       console.log("✅ 세션이 저장되었습니다!");
       console.log(`   📁 저장 위치: ${SESSION_FILE}`);

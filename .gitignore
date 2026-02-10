@@ -38,6 +38,17 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
+# Session/Cookie data (민감)
+naver-session/
+*.json.backup
+
+# Extracted data
+extracted-products.json
+data/
+
+# Screenshots (디버깅용)
+screenshots/
+
 # IDE
 .idea/
 .vscode/

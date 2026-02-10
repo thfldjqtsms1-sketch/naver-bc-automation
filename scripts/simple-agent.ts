@@ -10,15 +10,412 @@ import { Page } from "playwright";
 import { PrismaClient } from "@prisma/client";
 import * as path from "path";
 import * as fs from "fs";
+import * as os from "os";
 import OpenAI from "openai";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import Anthropic from "@anthropic-ai/sdk";
+
+// ============================================
+// OAuth Claude 설정 (캡차 풀이용)
+// ============================================
+const claudeCodeVersion = "2.1.2";
+const AUTH_PROFILES_PATH = path.join(os.homedir(), ".clawdbot", "agents", "main", "agent", "auth-profiles.json");
+
+function loadClaudeToken(): string | null {
+  try {
+    const content = fs.readFileSync(AUTH_PROFILES_PATH, "utf8");
+    const profiles = JSON.parse(content);
+    const oauthCred = profiles?.profiles?.["anthropic:claude-cli"];
+    if (oauthCred && oauthCred.type === "oauth" && Date.now() <= oauthCred.expires - 5 * 60 * 1000) {
+      return oauthCred.access;
+    }
+    const manualCred = profiles?.profiles?.["anthropic:manual"];
+    if (manualCred && manualCred.type === "token" && manualCred.token) {
+      return manualCred.token;
+    }
+  } catch {}
+  return process.env.ANTHROPIC_API_KEY || null;
+}
+
+function createClaudeClient(token: string): Anthropic {
+  return new Anthropic({
+    apiKey: null as any,
+    authToken: token,
+    dangerouslyAllowBrowser: true,
+    defaultHeaders: {
+      "anthropic-beta": "claude-code-20250219,oauth-2025-04-20",
+      "user-agent": `claude-cli/${claudeCodeVersion}`,
+      "x-app": "cli",
+    },
+  });
+}
+
+// ============================================
+// Captcha Exchange 경로
+// ============================================
+const CAPTCHA_EXCHANGE_DIR = path.join(process.cwd(), "captcha_exchange");
+
+// captcha_exchange 폴더 초기화
+function initCaptchaExchange() {
+  if (!fs.existsSync(CAPTCHA_EXCHANGE_DIR)) {
+    fs.mkdirSync(CAPTCHA_EXCHANGE_DIR, { recursive: true });
+  }
+  // 이전 파일들 정리
+  const files = ["captcha_image.png", "captcha_question.txt", "captcha_answer.txt"];
+  files.forEach(f => {
+    const p = path.join(CAPTCHA_EXCHANGE_DIR, f);
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  });
+}
+
+// ============================================
+// 자동 로그인 (세션 만료 시)
+// ============================================
+async function autoLogin(page: Page): Promise<boolean> {
+  const naverId = process.env.NAVER_ID;
+  const naverPw = process.env.NAVER_PW;
+  
+  if (!naverId || !naverPw) {
+    console.log("   ❌ .env에 NAVER_ID, NAVER_PW 없음");
+    return false;
+  }
+  
+  console.log("   🔐 자동 로그인 시도 중...");
+  
+  try {
+    // 로그인 페이지로 이동
+    await page.goto("https://nid.naver.com/nidlogin.login", { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    
+    // 아이디 입력
+    const idInput = await page.$('input[name="id"], input#id');
+    if (idInput) {
+      await idInput.fill(naverId);
+      await page.waitForTimeout(500);
+    }
+    
+    // 비밀번호 입력
+    const pwInput = await page.$('input[name="pw"], input#pw, input[type="password"]');
+    if (pwInput) {
+      await pwInput.fill(naverPw);
+      await page.waitForTimeout(500);
+    }
+    
+    // 로그인 버튼 클릭
+    const loginBtn = await page.$('button:has-text("로그인"), button.btn_login');
+    if (loginBtn) {
+      await loginBtn.click();
+      await page.waitForTimeout(3000);
+    }
+    
+    // 캡차 체크
+    const pageText = await page.textContent('body').catch(() => '');
+    if (pageText?.includes('보안 확인') || pageText?.includes('빈 칸을 채워주세요')) {
+      console.log("   ⚠️ 로그인 중 캡차 발생! captcha_exchange로 처리...");
+      const solved = await solveCaptchaViaExchange(page);
+      if (!solved) return false;
+    }
+    
+    // 로그인 성공 확인
+    await page.waitForTimeout(2000);
+    const currentUrl = page.url();
+    if (currentUrl.includes('nidlogin')) {
+      console.log("   ❌ 로그인 실패 (아직 로그인 페이지)");
+      return false;
+    }
+    
+    console.log("   ✅ 자동 로그인 성공!");
+    
+    // 세션 저장
+    const context = page.context();
+    const sessionPath = path.join(process.cwd(), "playwright", "storage", "naver-session.json");
+    await context.storageState({ path: sessionPath });
+    console.log("   💾 세션 저장 완료");
+    
+    return true;
+  } catch (error) {
+    console.log("   ❌ 자동 로그인 오류:", error);
+    return false;
+  }
+}
+
+// ============================================
+// 캡차 풀이 (captcha_exchange 방식 - Clawdbot 연동)
+// ============================================
+async function solveCaptchaViaExchange(page: Page): Promise<boolean> {
+  initCaptchaExchange();
+  
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    console.log(`   🔄 캡차 풀이 시도 ${attempt}/3 (captcha_exchange 방식)`);
+    
+    try {
+      // 1. 질문 추출
+      let questionText = "";
+      const questionEl = await page.$('p:has-text("[?]"), span:has-text("[?]"), div:has-text("빈 칸")');
+      if (questionEl) {
+        questionText = await questionEl.textContent() || "";
+      }
+      
+      // 2. 스크린샷 저장
+      const imagePath = path.join(CAPTCHA_EXCHANGE_DIR, "captcha_image.png");
+      await page.screenshot({ path: imagePath, fullPage: false });
+      
+      // 3. 질문 저장
+      const questionPath = path.join(CAPTCHA_EXCHANGE_DIR, "captcha_question.txt");
+      fs.writeFileSync(questionPath, questionText || "이미지에서 질문 확인");
+      
+      console.log(`   📸 캡차 저장: ${CAPTCHA_EXCHANGE_DIR}`);
+      console.log(`   📋 질문: ${questionText}`);
+      console.log("   ⏳ 답변 대기 중... (captcha_answer.txt)");
+      
+      // 4. 답변 파일 대기 (최대 120초)
+      const answerPath = path.join(CAPTCHA_EXCHANGE_DIR, "captcha_answer.txt");
+      let answer = "";
+      for (let i = 0; i < 60; i++) { // 2초 * 60 = 120초
+        await page.waitForTimeout(2000);
+        if (fs.existsSync(answerPath)) {
+          answer = fs.readFileSync(answerPath, "utf-8").trim();
+          if (answer) break;
+        }
+      }
+      
+      if (!answer) {
+        console.log("   ⏰ 답변 시간 초과");
+        continue;
+      }
+      
+      console.log(`   ✏️ 답변 입력: ${answer}`);
+      
+      // 5. 답변 입력
+      const inputField = await page.$('input[type="text"], input[name="answer"]');
+      if (inputField) {
+        await inputField.fill(answer);
+        await page.waitForTimeout(500);
+      }
+      
+      // 6. 확인 버튼 클릭
+      const confirmBtn = await page.$('button:has-text("확인"), button[type="submit"]');
+      if (confirmBtn) {
+        await confirmBtn.click();
+        await page.waitForTimeout(2000);
+      }
+      
+      // 7. 캡차 통과 확인
+      const newPageText = await page.textContent('body').catch(() => '');
+      if (!newPageText?.includes('보안 확인') && !newPageText?.includes('빈 칸을 채워주세요')) {
+        console.log("   ✅ 캡차 통과!");
+        // 파일 정리
+        initCaptchaExchange();
+        return true;
+      }
+      
+      console.log("   ❌ 캡차 실패, 재시도...");
+      initCaptchaExchange(); // 파일 정리 후 재시도
+      
+    } catch (error) {
+      console.log("   ❌ 캡차 처리 오류:", error);
+    }
+  }
+  
+  return false;
+}
+
+// ============================================
+// 캡차 감지 및 풀이 (Claude Vision) - 네이버 이미지 문제 형식
+// ============================================
+async function checkAndSolveCaptcha(page: Page): Promise<boolean> {
+  const url = page.url();
+  const pageText = await page.textContent('body').catch(() => '');
+  
+  // 로그인 페이지 감지 (캡차가 아님!)
+  const isLoginPage = url.includes('nidlogin') || 
+                      pageText?.includes('아이디 또는 전화번호') ||
+                      pageText?.includes('로그인 상태 유지');
+  
+  if (isLoginPage) {
+    console.log("   ⚠️ 로그인 세션 만료! 자동 로그인 시도...");
+    const loggedIn = await autoLogin(page);
+    if (!loggedIn) {
+      throw new Error("네이버 로그인 실패 - npm run login 실행하세요");
+    }
+    return true; // 로그인 성공, 재시도 필요
+  }
+  
+  // 캡차 페이지 감지 ("보안 확인" + 영수증/이미지 문제)
+  const isCaptchaPage = pageText?.includes('보안 확인') || 
+                        pageText?.includes('빈 칸을 채워주세요') ||
+                        pageText?.includes('캡차');
+  
+  if (!isCaptchaPage) {
+    return true; // 캡차 없음, 정상
+  }
+  
+  console.log("   ⚠️ 네이버 보안 확인(캡차) 페이지 감지!");
+  
+  // Vision API 가능 여부 체크 (OpenAI 또는 Gemini 키 필요)
+  const hasVisionAPI = !!process.env.OPENAI_API_KEY || !!process.env.GEMINI_API_KEY;
+  
+  if (!hasVisionAPI) {
+    console.log("   ⚠️ Vision API 키 없음 - captcha_exchange 방식으로 전환");
+    return await solveCaptchaViaExchange(page);
+  }
+  
+  const token = loadClaudeToken();
+  const claude = token ? createClaudeClient(token) : null;
+  
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    console.log(`   🔄 캡차 풀이 시도 ${attempt}/5`);
+    
+    try {
+      // 질문 텍스트 추출 (영수증의 가게 위치는 가구길 [?] 입니다 등)
+      let questionText = "";
+      const questionEl = await page.$('p:has-text("[?]"), span:has-text("[?]"), div:has-text("빈 칸을 채워주세요")');
+      if (questionEl) {
+        questionText = await questionEl.textContent() || "";
+      }
+      console.log(`   📋 질문: ${questionText}`);
+      
+      // 캡차 이미지 스크린샷 (전체 페이지)
+      const screenshotPath = path.join(process.cwd(), "temp_images", `captcha_${Date.now()}.png`);
+      await page.screenshot({ path: screenshotPath, fullPage: false });
+      
+      // Base64 인코딩
+      const imageData = fs.readFileSync(screenshotPath).toString("base64");
+      
+      // Vision API로 이미지 분석 (OpenAI > Gemini 순서)
+      let captchaResponse = "";
+      
+      const visionPrompt = `이 네이버 보안 캡차 이미지에서 영수증/문서를 읽어.
+                
+질문: "${questionText || '이미지에서 질문 확인'}"
+
+규칙: 질문의 [?]에 해당하는 숫자만 출력. 설명 없이 숫자만!
+
+정답:`;
+      
+      // 1. OpenAI Vision 시도
+      if (process.env.OPENAI_API_KEY && !captchaResponse) {
+        try {
+          const openaiVision = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+          const visionResult = await openaiVision.chat.completions.create({
+            model: "gpt-4o",
+            max_tokens: 50,
+            messages: [{
+              role: "user",
+              content: [
+                { type: "image_url", image_url: { url: `data:image/png;base64,${imageData}` } },
+                { type: "text", text: visionPrompt }
+              ]
+            }]
+          });
+          captchaResponse = visionResult.choices[0]?.message?.content || "";
+          console.log(`   🤖 OpenAI Vision 사용`);
+        } catch (e: any) {
+          console.log(`   ⚠️ OpenAI Vision 실패: ${e.message}`);
+        }
+      }
+      
+      // 2. Gemini Vision 시도
+      if (process.env.GEMINI_API_KEY && !captchaResponse) {
+        try {
+          const geminiVision = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+          const model = geminiVision.getGenerativeModel({ model: "gemini-2.0-flash" });
+          const result = await model.generateContent([
+            { inlineData: { mimeType: "image/png", data: imageData } },
+            visionPrompt
+          ]);
+          captchaResponse = result.response.text() || "";
+          console.log(`   🤖 Gemini Vision 사용`);
+        } catch (e: any) {
+          console.log(`   ⚠️ Gemini Vision 실패: ${e.message}`);
+        }
+      }
+      
+      // 숫자만 추출 (첫번째 연속 숫자)
+      const numMatch = captchaResponse.match(/\d+/);
+      let captchaAnswer = numMatch ? numMatch[0] : captchaResponse.replace(/[^\d]/g, '');
+      console.log(`   📝 캡차 정답: "${captchaAnswer}"`);
+      
+      if (!captchaAnswer) {
+        console.log(`   ⚠️ 정답 추출 실패`);
+        // 새로고침 버튼 클릭해서 새 문제 받기
+        const refreshBtn = await page.$('button:has-text("새로고침")');
+        if (refreshBtn) await refreshBtn.click();
+        await page.waitForTimeout(2000);
+        continue;
+      }
+      
+      // 캡차 입력 필드 찾기 & 입력
+      const inputSelectors = [
+        'input[placeholder*="정답"]',
+        'input[placeholder*="입력"]',
+        'input[type="text"]',
+      ];
+      
+      let inputFound = false;
+      for (const selector of inputSelectors) {
+        const input = await page.$(selector);
+        if (input && await input.isVisible()) {
+          await input.fill('');  // 기존 내용 지우기
+          await input.fill(captchaAnswer);
+          console.log(`   ✅ 정답 입력: ${captchaAnswer}`);
+          inputFound = true;
+          break;
+        }
+      }
+      
+      if (!inputFound) {
+        console.log(`   ⚠️ 입력 필드 못 찾음`);
+        continue;
+      }
+      
+      await page.waitForTimeout(500);
+      
+      // 확인 버튼 클릭
+      const submitBtn = await page.$('button:has-text("확인")');
+      if (submitBtn && await submitBtn.isVisible()) {
+        await submitBtn.click();
+        console.log(`   🔘 확인 버튼 클릭`);
+      }
+      
+      await page.waitForTimeout(3000);
+      
+      // 스크린샷 파일 정리
+      try { fs.unlinkSync(screenshotPath); } catch {}
+      
+      // 캡차 해결됐는지 확인
+      const newUrl = page.url();
+      const newText = await page.textContent('body').catch(() => '');
+      if (!newUrl.includes('nid.naver.com') && !newText?.includes('보안 확인')) {
+        console.log(`   ✅ 캡차 해결 성공!`);
+        return true;
+      }
+      
+      // 오류 메시지 확인
+      const errorMsg = await page.$('text=정답이 아닙니다, text=다시 시도');
+      if (errorMsg) {
+        console.log(`   ❌ 오답, 새 문제로 재시도...`);
+        const refreshBtn = await page.$('button:has-text("새로고침")');
+        if (refreshBtn) await refreshBtn.click();
+        await page.waitForTimeout(2000);
+      }
+      
+    } catch (e: any) {
+      console.log(`   ⚠️ 캡차 풀이 오류: ${e.message}`);
+    }
+  }
+  
+  console.log("   ❌ 캡차 5회 실패. 수동 해결 필요 (60초 대기)...");
+  await page.waitForTimeout(60000);
+  return !page.url().includes('nid.naver.com');
+}
 
 // Stealth 플러그인 적용 (봇 감지 우회)
 chromium.use(StealthPlugin());
 
 const prisma = new PrismaClient();
 
-// AI Provider 설정 (openai 또는 gemini)
+// AI Provider 설정 (openai, gemini, 또는 oauth)
 const AI_PROVIDER = (process.env.AI_PROVIDER || "openai").toLowerCase();
 
 // OpenAI 초기화
@@ -30,6 +427,19 @@ const openai = AI_PROVIDER === "openai"
 const gemini = AI_PROVIDER === "gemini" 
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "")
   : null;
+
+// OAuth (Claude) 설정 - clawdbot 토큰 우선 사용
+let oauthClient: Anthropic | null = null;
+if (AI_PROVIDER === "oauth") {
+  // clawdbot 토큰 우선 (Claude Code 방식으로 동작)
+  const token = loadClaudeToken();
+  if (token) {
+    oauthClient = createClaudeClient(token);
+    console.log("✅ OAuth (Claude) 클라이언트 초기화 완료 (clawdbot 토큰)");
+  } else {
+    console.log("⚠️ OAuth 토큰 없음 - clawdbot 실행 필요");
+  }
+}
 
 const SESSION_FILE = path.join(process.cwd(), "playwright", "storage", "naver-session.json");
 const TEMP_PATH = path.join(process.cwd(), "temp_images");
@@ -58,19 +468,44 @@ async function step1_getProductInfo(page: Page, url: string): Promise<ProductInf
   console.log("\n📦 STEP 1: 상품 정보 수집");
   
   await page.goto(url, { timeout: 30000 });
-  await page.waitForTimeout(5000);
+  await page.waitForTimeout(3000);
+  
+  // 캡차 체크 및 해결
+  const captchaSolved = await checkAndSolveCaptcha(page);
+  if (!captchaSolved) {
+    throw new Error("캡차 해결 실패 - 수동 확인 필요");
+  }
+  
+  // 캡차 후 원래 URL로 다시 이동 (리다이렉트 됐을 수 있음)
+  if (!page.url().includes('smartstore') && !page.url().includes('shopping')) {
+    console.log("   🔄 상품 페이지로 재이동...");
+    await page.goto(url, { timeout: 30000 });
+    await page.waitForTimeout(3000);
+  }
+  
+  await page.waitForTimeout(2000);
   
   // 1. 상품명 추출 (여러 방법 시도)
   let productName = "";
   
-  // og:title에서 추출
-  const ogTitle = await page.$('meta[property="og:title"]');
-  if (ogTitle) {
-    const content = await ogTitle.getAttribute('content');
-    if (content) productName = content.split(':')[0].split('-')[0].trim();
+  try {
+    // og:title에서 추출
+    const ogTitle = await page.$('meta[property="og:title"]');
+    if (ogTitle) {
+      const content = await ogTitle.getAttribute('content');
+      if (content) productName = content.split(':')[0].split('-')[0].trim();
+    }
+  } catch (e: any) {
+    if (e.message.includes('context') || e.message.includes('destroyed') || e.message.includes('navigation')) {
+      console.log("   ⚠️ 페이지 변경 감지, 캡차 재확인...");
+      const resolved = await checkAndSolveCaptcha(page);
+      if (!resolved) throw new Error("캡차 해결 실패");
+      await page.goto(url, { timeout: 30000 });
+      await page.waitForTimeout(3000);
+    }
   }
   
-  // 페이지 내 상품명 요소에서 추출 (더 정확)
+  // 페이지 내 상품명 요소에서 추출 (더 정확) - try-catch로 context 에러 처리
   const nameSelectors = [
     '._3oDjSvLwEZ',           // 스마트스토어 상품명
     '.product_title',
@@ -330,10 +765,28 @@ async function downloadImage(url: string, filePath: string): Promise<void> {
 }
 
 // ============================================
-// AI 공통 호출 함수 (OpenAI / Gemini)
+// AI 공통 호출 함수 (OpenAI / Gemini / OAuth)
 // ============================================
 async function generateWithAI(systemPrompt: string, userPrompt: string): Promise<string> {
-  if (AI_PROVIDER === "gemini" && gemini) {
+  if (AI_PROVIDER === "oauth" && oauthClient) {
+    // OAuth (Claude) 사용
+    const model = process.env.OAUTH_MODEL || "claude-sonnet-4-20250514";
+    console.log(`   🤖 Using OAuth model: ${model}`);
+    
+    const response = await oauthClient.messages.create({
+      model,
+      max_tokens: 4000,
+      system: [
+        { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude.", cache_control: { type: "ephemeral" } },
+        { type: "text", text: systemPrompt, cache_control: { type: "ephemeral" } }
+      ],
+      messages: [{ role: "user", content: userPrompt }]
+    });
+    
+    const textBlock = response.content.find((b) => b.type === "text");
+    return textBlock && "text" in textBlock ? textBlock.text : "";
+    
+  } else if (AI_PROVIDER === "gemini" && gemini) {
     // Gemini 사용
     const model = gemini.getGenerativeModel({ 
       model: "gemini-2.5-flash",
@@ -502,20 +955,57 @@ ${product.rating ? `- 평점: ${product.rating}점` : ''}
 async function step3_openEditor(page: Page): Promise<void> {
   console.log("\n📄 STEP 3: 블로그 글쓰기 페이지");
   
-  await page.goto(`https://blog.naver.com/${NAVER_BLOG_ID}/postwrite`, { timeout: 30000 });
-  await page.waitForTimeout(5000);
-  
-  // 팝업 닫기 (작성 중인 글 있습니다)
-  try {
-    const cancelBtn = await page.$('.se-popup-button-cancel');
-    if (cancelBtn) {
-      await cancelBtn.click();
-      console.log("   팝업 닫음");
-      await page.waitForTimeout(1000);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await page.goto(`https://blog.naver.com/${NAVER_BLOG_ID}/postwrite`, { timeout: 30000 });
+    await page.waitForTimeout(3000);
+    
+    // 로그인/캡차 체크
+    const currentUrl = page.url();
+    const bodyText = await page.textContent('body').catch(() => '');
+    
+    // 로그인 페이지 체크
+    if (currentUrl.includes('nidlogin') || bodyText?.includes('아이디 또는 전화번호')) {
+      console.log("   ⚠️ 로그인 필요! 자동 로그인 시도...");
+      const loggedIn = await autoLogin(page);
+      if (!loggedIn) {
+        throw new Error("네이버 로그인 실패 - npm run login 실행하세요");
+      }
+      continue; // 로그인 후 다시 시도
     }
-  } catch {}
+    
+    // 캡차 페이지 체크
+    if (bodyText?.includes('보안 확인') || bodyText?.includes('빈 칸을 채워주세요')) {
+      console.log(`   ⚠️ 캡차 발생 (시도 ${attempt}/3)`);
+      const solved = await checkAndSolveCaptcha(page);
+      if (!solved) {
+        throw new Error("블로그 접근 시 캡차 해결 실패");
+      }
+      continue; // 캡차 풀고 다시 시도
+    }
+    
+    // 에디터 페이지 확인
+    await page.waitForTimeout(2000);
+    const editorExists = await page.$('.se-documentTitle, .se-component-content, [class*="editor"]');
+    if (!editorExists) {
+      console.log(`   ⚠️ 에디터 로드 안됨, 재시도... (${attempt}/3)`);
+      continue;
+    }
+    
+    // 팝업 닫기 (작성 중인 글 있습니다)
+    try {
+      const cancelBtn = await page.$('.se-popup-button-cancel');
+      if (cancelBtn) {
+        await cancelBtn.click();
+        console.log("   팝업 닫음");
+        await page.waitForTimeout(1000);
+      }
+    } catch {}
+    
+    console.log("   ✅ 에디터 준비 완료");
+    return;
+  }
   
-  console.log("   ✅ 에디터 준비 완료");
+  throw new Error("블로그 에디터 로드 실패 (3회 시도)");
 }
 
 // ============================================
@@ -524,13 +1014,36 @@ async function step3_openEditor(page: Page): Promise<void> {
 async function step4_inputTitle(page: Page, title: string): Promise<void> {
   console.log("\n✏️ STEP 4: 제목 입력");
   
-  // 제목 영역 클릭
-  const titleArea = await page.$('.se-documentTitle .se-text-paragraph');
-  if (titleArea) {
-    await titleArea.click();
-    await page.waitForTimeout(300);
-  } else {
-    // 좌표로 클릭 (제목 위치)
+  // 에디터 페이지 재확인
+  const currentUrl = page.url();
+  if (!currentUrl.includes('postwrite') && !currentUrl.includes('blog.naver.com')) {
+    throw new Error(`에디터 페이지가 아님: ${currentUrl}`);
+  }
+  
+  // 제목 영역 클릭 (여러 셀렉터 시도)
+  const titleSelectors = [
+    '.se-documentTitle .se-text-paragraph',
+    '.se-documentTitle',
+    '[class*="title"] [contenteditable="true"]',
+    '.se-ff-nanumgothic.se-fs32',
+  ];
+  
+  let titleArea = null;
+  for (const selector of titleSelectors) {
+    titleArea = await page.$(selector);
+    if (titleArea && await titleArea.isVisible()) {
+      await titleArea.click();
+      console.log(`   제목 영역 클릭: ${selector}`);
+      await page.waitForTimeout(300);
+      break;
+    }
+  }
+  
+  if (!titleArea) {
+    console.log("   ⚠️ 제목 영역 못 찾음, 좌표 클릭 시도...");
+    // 스크롤 맨 위로
+    await page.evaluate('window.scrollTo(0, 0)');
+    await page.waitForTimeout(500);
     await page.mouse.click(640, 130);
     await page.waitForTimeout(300);
   }
@@ -544,18 +1057,35 @@ async function step4_inputTitle(page: Page, title: string): Promise<void> {
 // ============================================
 async function uploadOneImage(page: Page, imagePath: string): Promise<boolean> {
   try {
-    const imageBtn = await page.$('button[data-name="image"]');
-    if (imageBtn) {
-      const [fileChooser] = await Promise.all([
-        page.waitForEvent('filechooser', { timeout: 5000 }).catch(() => null),
-        imageBtn.click()
-      ]);
-      
-      if (fileChooser) {
-        await fileChooser.setFiles(imagePath);
-        await page.waitForTimeout(2500); // 업로드 완료 대기
-        return true;
-      }
+    // 이미지 버튼 셀렉터 (여러 가지 시도)
+    const imageBtnSelectors = [
+      'button[data-name="image"]',
+      'button.se-image-toolbar-button',
+      'button[class*="image"]',
+      '.se-toolbar button:has(svg[class*="image"])',
+    ];
+    
+    let imageBtn = null;
+    for (const selector of imageBtnSelectors) {
+      imageBtn = await page.$(selector);
+      if (imageBtn && await imageBtn.isVisible()) break;
+      imageBtn = null;
+    }
+    
+    if (!imageBtn) {
+      console.log(`   ⚠️ 이미지 버튼 못 찾음`);
+      return false;
+    }
+    
+    const [fileChooser] = await Promise.all([
+      page.waitForEvent('filechooser', { timeout: 5000 }).catch(() => null),
+      imageBtn.click()
+    ]);
+    
+    if (fileChooser) {
+      await fileChooser.setFiles(imagePath);
+      await page.waitForTimeout(2500); // 업로드 완료 대기
+      return true;
     }
   } catch (e) {
     console.log(`   ⚠️ 업로드 실패: ${e}`);

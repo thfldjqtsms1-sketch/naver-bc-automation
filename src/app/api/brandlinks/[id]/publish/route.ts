@@ -34,10 +34,10 @@ export async function POST(
     // 발행 스크립트 실행 (백그라운드) - 단순 에이전트 사용
     const scriptPath = path.join(process.cwd(), "scripts", "simple-agent.ts");
     
-    const child = spawn("npx", ["ts-node", "--project", "tsconfig.scripts.json", scriptPath, id], {
+    const child = spawn("npx", ["tsx", scriptPath, id], {
       cwd: process.cwd(),
       detached: true,
-      stdio: "ignore",
+      stdio: "inherit",  // 로그 터미널에 출력
       shell: true,
     });
     
